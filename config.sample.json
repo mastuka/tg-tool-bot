@@ -1,5 +1,7 @@
 {
     "bot_token": "7709950250:AAGXCkwedMGYdIT0Rs67pHJ729B4pHSsXpg",
+    "api_id": "YOUR_API_ID",
+    "api_hash": "YOUR_API_HASH",
     "authorized_users": [7939220128],
     "delay_min": 15,
     "delay_max": 45,

@@ -11,29 +11,33 @@ class TelegramForwardingManager:
     def __init__(self, account_manager):
         self.account_manager = account_manager
         self.forwarding_sessions = {}
-        self.forwarding_rules = {}
+        # self.forwarding_rules = {} # This likely was meant to be loaded from DB, get_forwarding_rules does that.
         self._initialized = False
-        
-        # Initialize logger FIRST before anything else
-        self.logger = logging.getLogger('ForwardingManager')
-        if not self.logger.handlers:
-            handler = logging.FileHandler('logs/forwarding.log')
+
+        self.logger = logging.getLogger(__name__) # Use __name__ for module-level logger
+        # Configure logger only if no handlers are already set (to avoid duplicate logs if main app configures root)
+        if not self.logger.handlers and not logging.getLogger().handlers:
+            log_file = Path(self.account_manager._config.get('logs_path', 'logs')) / 'forwarding_manager.log'
+            log_file.parent.mkdir(parents=True, exist_ok=True)
+            handler = logging.FileHandler(log_file)
             formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
             handler.setFormatter(formatter)
             self.logger.addHandler(handler)
-            self.logger.setLevel(logging.INFO)
-        
-        # Setup database connection
+            self.logger.setLevel(self.account_manager._config.get('log_level', logging.INFO))
+
         self.db_connection = None
-        
+
     async def initialize(self):
         """Initialize the forwarding manager asynchronously"""
         if not self._initialized:
-            # Setup database
-            self.db_connection = sqlite3.connect('forwarding.db', check_same_thread=False)
+            db_path = Path(self.account_manager._config['sessions_path']) / self.account_manager._config.get('forwarding_database_name', 'forwarding.db')
+            self.db_connection = sqlite3.connect(db_path, check_same_thread=False)
+            self.db_connection.row_factory = sqlite3.Row # Access columns by name
             self.setup_database()
+            # Load active rules or prepare sessions on init if needed (currently lazy)
+            await self.restart_active_rules_from_db()
             self._initialized = True
-        
+
     def setup_database(self):
         """Setup SQLite database for forwarding configuration"""
         try:
@@ -41,34 +45,34 @@ class TelegramForwardingManager:
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS forwarding_rules (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    account_phone TEXT,
-                    source_chat_id INTEGER,
+                    account_phone TEXT NOT NULL,
+                    source_chat_id INTEGER NOT NULL,
                     source_chat_name TEXT,
-                    destination_chat_ids TEXT,
-                    keywords TEXT,
-                    status TEXT DEFAULT 'stopped',
+                    destination_chat_ids TEXT NOT NULL, -- JSON list of chat IDs
+                    keywords TEXT, -- JSON list of keywords or NULL
+                    status TEXT DEFAULT 'stopped', -- 'running', 'stopped', 'error'
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    last_message_id INTEGER DEFAULT 0,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    last_message_id INTEGER DEFAULT 0, -- For tracking last forwarded message
                     messages_forwarded INTEGER DEFAULT 0
                 )
             ''')
-            
+
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS forwarded_messages (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    rule_id INTEGER,
-                    account_phone TEXT,
-                    source_chat_id INTEGER,
-                    source_message_id INTEGER,
-                    destination_chat_id INTEGER,
-                    destination_message_id INTEGER,
+                    rule_id INTEGER NOT NULL,
+                    account_phone TEXT NOT NULL,
+                    source_chat_id INTEGER NOT NULL,
+                    source_message_id INTEGER NOT NULL,
+                    destination_chat_id INTEGER NOT NULL,
+                    destination_message_id INTEGER, -- Can be NULL if forward fails before getting new ID
                     message_text TEXT,
                     forwarded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    FOREIGN KEY (rule_id) REFERENCES forwarding_rules (id)
+                    FOREIGN KEY (rule_id) REFERENCES forwarding_rules (id) ON DELETE CASCADE
                 )
             ''')
-            
-            # Add error logging table
+
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS forwarding_errors (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -76,503 +80,561 @@ class TelegramForwardingManager:
                     account_phone TEXT,
                     error_type TEXT,
                     error_message TEXT,
-                    occurred_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    occurred_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (rule_id) REFERENCES forwarding_rules (id) ON DELETE CASCADE
                 )
             ''')
-            
+
             self.db_connection.commit()
-            self.logger.info("Database setup completed")
-            
+            self.logger.info("Forwarding database setup/verified successfully.")
+
         except Exception as e:
-            print(f"Error setting up database: {e}")  # Fallback to print if logger fails
-    
+            self.logger.error(f"Error setting up forwarding database: {e}", exc_info=True)
+            # Fallback to print if logger itself failed during init
+            if not self.logger.handlers: print(f"CRITICAL: Logger not set up. DB Error: {e}")
+            raise # Propagate error if DB setup fails
+
+    async def close(self):
+        """Close database connection and clean up resources."""
+        self.logger.info("Closing ForwardingManager resources...")
+        # Stop all active forwarding sessions first
+        # This might involve iterating through self.forwarding_sessions and calling stop_forwarding
+        # For simplicity, we assume event handlers will stop if client disconnects or via status check
+        # A more robust stop would explicitly remove event handlers.
+        # For now, we just ensure the DB connection is closed.
+        active_rule_ids = [session_data['rule_id'] for session_data in self.forwarding_sessions.values() if session_data.get('status') == 'running']
+        for rule_id in active_rule_ids:
+            await self.stop_forwarding(rule_id, update_db=False) # Stop without individual DB update, will be overall inactive
+
+        if self.db_connection:
+            try:
+                self.db_connection.close()
+                self.db_connection = None
+                self.logger.info("ForwardingManager database connection closed.")
+            except sqlite3.Error as e:
+                self.logger.error(f"Error closing ForwardingManager database connection: {e}")
+        self._initialized = False
+
+
     async def get_account_groups(self, account_phone):
-        """Get all groups/channels the account is member of with enhanced error handling"""
         account = self.account_manager.get_account_by_phone(account_phone)
-        if not account or not account['client']:
-            self.logger.error(f"Account {account_phone} not found or client not available")
+        if not account:
+            self.logger.error(f"Account {account_phone} not found via account_manager.")
             return []
-        
+
+        client = self.account_manager._clients.get(account_phone) # Access client via _clients
+        if not client:
+            self.logger.error(f"Client for account {account_phone} not found in account_manager._clients.")
+            # Try to connect it if AccountManager allows direct connect
+            # This depends on AccountManager's design. For now, assume client should be ready.
+            return []
+
+        if not client.is_connected():
+            self.logger.warning(f"Client for {account_phone} is not connected. Attempting to connect.")
+            # This might be better handled by ensuring connect_account is called before this
+            # For now, let's try a connect if AccountManager provides such a method readily.
+            # success, _ = await self.account_manager.connect_account(account_phone) # Assuming this exists and works
+            # if not success or not client.is_connected():
+            #     self.logger.error(f"Failed to connect account {account_phone} for get_account_groups.")
+            #     return []
+            # For this refactor, we assume client is managed by AccountManager and should be ready/connectable
+            # by the time this is called, or this method should handle it gracefully.
+            # Simplification: if not connected, return empty for now. A robust app would ensure connection.
+            self.logger.error(f"Account {account_phone} client not connected. Cannot fetch groups.")
+            return []
+
+
         try:
-            client = account['client']
             if not await client.is_user_authorized():
-                self.logger.error(f"Account {account_phone} is not authorized")
+                self.logger.error(f"Account {account_phone} is not authorized.")
                 return []
-            
-            # Get dialogs with retry logic
-            retries = 3
-            for attempt in range(retries):
-                try:
-                    dialogs = await client.get_dialogs()
-                    break
-                except Exception as e:
-                    if attempt == retries - 1:
-                        raise e
-                    await asyncio.sleep(2)
-            
+
+            dialogs = await client.get_dialogs()
             groups = []
             for dialog in dialogs:
-                try:
-                    entity = dialog.entity
-                    
-                    if isinstance(entity, (Channel, Chat)):
-                        if isinstance(entity, Channel):
-                            # Include both channels and supergroups where we can send messages
-                            if hasattr(entity, 'broadcast') and entity.broadcast:
-                                # Skip broadcast channels unless we're admin
-                                if not hasattr(entity, 'admin_rights') or not entity.admin_rights:
-                                    continue
-                                    
-                            groups.append({
-                                'id': entity.id,
-                                'title': entity.title or f"Channel {entity.id}",
-                                'username': getattr(entity, 'username', None),
-                                'type': 'supergroup' if getattr(entity, 'megagroup', False) else 'channel',
-                                'members_count': getattr(entity, 'participants_count', 0),
-                                'can_send_messages': True
-                            })
-                        else:  # Regular group
-                            groups.append({
-                                'id': entity.id,
-                                'title': entity.title or f"Group {entity.id}",
-                                'username': None,
-                                'type': 'group',
-                                'members_count': getattr(entity, 'participants_count', 0),
-                                'can_send_messages': True
-                            })
-                except Exception as e:
-                    self.logger.warning(f"Error processing dialog entity: {e}")
-                    continue
-            
-            self.logger.info(f"Found {len(groups)} groups for {account_phone}")
+                entity = dialog.entity
+                if isinstance(entity, (types.Channel, types.Chat)): # Check if it's a Channel or Chat (group)
+                    # Basic filtering: exclude private chats with users, focus on groups/channels
+                    if isinstance(entity, types.User): continue
+
+                    title = getattr(entity, 'title', f"Unknown Chat/Channel {entity.id}")
+                    username = getattr(entity, 'username', None)
+                    participants_count = getattr(entity, 'participants_count', 0)
+
+                    is_channel = isinstance(entity, types.Channel)
+                    is_broadcast = is_channel and getattr(entity, 'broadcast', False)
+                    is_megagroup = is_channel and getattr(entity, 'megagroup', False)
+
+                    chat_type = 'unknown'
+                    if is_broadcast: chat_type = 'channel' # Broadcast channel
+                    elif is_megagroup: chat_type = 'supergroup'
+                    elif isinstance(entity, types.Chat): chat_type = 'group' # Basic group
+
+                    # Can we send messages? (Simplistic check, real permissions are complex)
+                    can_send = True # Assume true, refine if specific checks are needed
+                    if hasattr(entity, 'admin_rights'):
+                        can_send = entity.admin_rights.send_messages if entity.admin_rights else True
+                    elif hasattr(entity, 'default_banned_rights'):
+                        can_send = not entity.default_banned_rights.send_messages if entity.default_banned_rights else True
+
+                    groups.append({
+                        'id': entity.id, 'title': title, 'username': username,
+                        'type': chat_type, 'members_count': participants_count,
+                        'can_send_messages': can_send # Note: This is a basic check
+                    })
+
+            self.logger.info(f"Found {len(groups)} potential groups/channels for {account_phone}")
             return groups
-            
+
         except Exception as e:
-            self.logger.error(f"Error getting groups for {account_phone}: {e}")
+            self.logger.error(f"Error getting groups for {account_phone}: {e}", exc_info=True)
             return []
-    
-    async def create_forwarding_rule(self, account_phone, source_chat_id, source_chat_name, 
+
+    async def create_forwarding_rule(self, account_phone, source_chat_id, source_chat_name,
                                    destination_chat_ids, keywords=None):
-        """Create a new forwarding rule with enhanced validation"""
+        if not self._initialized or not self.db_connection:
+            self.logger.error("Database not initialized. Cannot create rule.")
+            raise Exception("Database not initialized.")
         try:
             cursor = self.db_connection.cursor()
-            
-            dest_ids_json = json.dumps(destination_chat_ids)
+            dest_ids_json = json.dumps(list(set(destination_chat_ids))) # Ensure unique IDs
             keywords_json = json.dumps(keywords) if keywords else None
-            
+            now = datetime.now(timezone.utc) # Use timezone-aware datetime
+
             cursor.execute('''
-                INSERT INTO forwarding_rules 
-                (account_phone, source_chat_id, source_chat_name, destination_chat_ids, keywords)
-                VALUES (?, ?, ?, ?, ?)
-            ''', (account_phone, source_chat_id, source_chat_name, dest_ids_json, keywords_json))
-            
+                INSERT INTO forwarding_rules
+                (account_phone, source_chat_id, source_chat_name, destination_chat_ids, keywords, status, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (account_phone, source_chat_id, source_chat_name, dest_ids_json, keywords_json, 'stopped', now, now))
+
             rule_id = cursor.lastrowid
             self.db_connection.commit()
-            
-            self.logger.info(f"Created forwarding rule {rule_id} for {account_phone}")
+
+            self.logger.info(f"Created forwarding rule {rule_id} for account {account_phone} from source {source_chat_name} ({source_chat_id}).")
             return rule_id
-            
+        except sqlite3.Error as e:
+            self.logger.error(f"Database error creating forwarding rule: {e}", exc_info=True)
+            raise
         except Exception as e:
-            self.logger.error(f"Error creating forwarding rule: {e}")
-            raise e
-    
+            self.logger.error(f"Unexpected error creating forwarding rule: {e}", exc_info=True)
+            raise
+
+    async def delete_forwarding_rule(self, rule_id: int) -> Tuple[bool, str]:
+        """Stops forwarding and deletes the rule from the database."""
+        if not self._initialized or not self.db_connection:
+            self.logger.error("Database not initialized. Cannot delete rule.")
+            return False, "Database not initialized."
+
+        self.logger.info(f"Attempting to delete forwarding rule ID: {rule_id}")
+
+        # First, ensure the rule is stopped
+        stop_success, stop_message = await self.stop_forwarding(rule_id, update_db=False) # Stop session, don't update DB status yet
+        if not stop_success and "Rule not found" not in stop_message : # If it wasn't found, it's already "stopped" in a way
+            self.logger.warning(f"Could not stop rule {rule_id} (or it was already stopped): {stop_message}. Proceeding with deletion.")
+            # If stop_forwarding failed for other reasons, we might still want to delete from DB.
+
+        try:
+            cursor = self.db_connection.cursor()
+            cursor.execute("DELETE FROM forwarding_rules WHERE id = ?", (rule_id,))
+            self.db_connection.commit()
+
+            if cursor.rowcount > 0:
+                self.logger.info(f"Successfully deleted forwarding rule {rule_id} from database.")
+                return True, f"Rule {rule_id} deleted successfully."
+            else:
+                self.logger.warning(f"Rule {rule_id} not found in database for deletion.")
+                return False, f"Rule {rule_id} not found in database."
+        except sqlite3.Error as e:
+            self.logger.error(f"Database error deleting rule {rule_id}: {e}", exc_info=True)
+            return False, f"Database error: {e}"
+        except Exception as e:
+            self.logger.error(f"Unexpected error deleting rule {rule_id}: {e}", exc_info=True)
+            return False, f"Unexpected error: {e}"
+
     async def start_forwarding(self, rule_id):
-        """Start message forwarding for a specific rule with enhanced error handling"""
+        if not self._initialized or not self.db_connection:
+            self.logger.error("Database not initialized. Cannot start rule.")
+            return False, "Database not initialized."
         try:
             cursor = self.db_connection.cursor()
-            cursor.execute('SELECT * FROM forwarding_rules WHERE id = ?', (rule_id,))
-            rule = cursor.fetchone()
-            
-            if not rule:
-                return False, "Rule not found"
-            
-            account_phone = rule[1]
-            source_chat_id = rule[2]
-            destination_chat_ids = json.loads(rule[4])
-            keywords = json.loads(rule[5]) if rule[5] else None
-            
+            cursor.execute("SELECT * FROM forwarding_rules WHERE id = ?", (rule_id,))
+            rule_row = cursor.fetchone()
+
+            if not rule_row: return False, "Rule not found"
+            rule = dict(rule_row) # Convert to dict for easier access
+
+            account_phone = rule['account_phone']
+            source_chat_id = rule['source_chat_id']
+
+            session_key = f"{account_phone}_{rule_id}"
+            if session_key in self.forwarding_sessions and self.forwarding_sessions[session_key]['status'] == 'running':
+                return True, "Forwarding already running for this rule."
+
             account = self.account_manager.get_account_by_phone(account_phone)
-            if not account or not account['client']:
-                return False, "Account not available or not connected"
-            
-            # Verify account is authorized
-            try:
-                if not await account['client'].is_user_authorized():
-                    return False, "Account is not authorized"
-            except Exception as e:
-                return False, f"Account connection error: {str(e)}"
-            
-            # Update rule status
-            cursor.execute('UPDATE forwarding_rules SET status = ? WHERE id = ?', ('running', rule_id))
+            client = self.account_manager._clients.get(account_phone)
+
+            if not account or not client:
+                return False, f"Account {account_phone} or its client not available/initialized."
+            if not client.is_connected():
+                self.logger.info(f"Client for {account_phone} not connected. Attempting connect for rule {rule_id}.")
+                conn_success, conn_msg = await self.account_manager.connect_account(account_phone)
+                if not conn_success: return False, f"Failed to connect account {account_phone}: {conn_msg}"
+                # Client might be a new instance, re-fetch from account_manager
+                client = self.account_manager._clients.get(account_phone)
+                if not client: return False, "Client unavailable after reconnect attempt."
+
+
+            if not await client.is_user_authorized():
+                return False, f"Account {account_phone} is not authorized."
+
+            now = datetime.now(timezone.utc)
+            cursor.execute("UPDATE forwarding_rules SET status = 'running', updated_at = ? WHERE id = ?", (now, rule_id))
             self.db_connection.commit()
-            
-            # Start forwarding session
-            session_key = f"{account_phone}_{rule_id}"
+
             self.forwarding_sessions[session_key] = {
-                'rule_id': rule_id,
-                'account': account,
+                'rule_id': rule_id, 'account': account, 'client': client, # Store client directly
                 'source_chat_id': source_chat_id,
-                'destination_chat_ids': destination_chat_ids,
-                'keywords': keywords,
-                'status': 'running',
-                'messages_forwarded': 0,
-                'last_activity': datetime.now()
+                'destination_chat_ids': json.loads(rule['destination_chat_ids']),
+                'keywords': json.loads(rule['keywords']) if rule['keywords'] else None,
+                'status': 'running', 'messages_forwarded': rule['messages_forwarded'],
+                'last_activity': now, 'last_message_id': rule.get('last_message_id', 0)
             }
-            
-            # Set up event handler
+
             await self.setup_forwarding_handler(session_key)
-            
-            self.logger.info(f"Started forwarding for rule {rule_id}")
-            return True, "Forwarding started successfully"
-            
+            self.logger.info(f"Started forwarding for rule {rule_id} on account {account_phone}.")
+            return True, "Forwarding started successfully."
+
         except Exception as e:
-            self.logger.error(f"Error starting forwarding for rule {rule_id}: {e}")
-            self.log_error(rule_id, account_phone if 'account_phone' in locals() else 'unknown', 
-                          'start_error', str(e))
-            return False, f"Error starting forwarding: {str(e)}"
-    
+            self.logger.error(f"Error starting forwarding for rule {rule_id}: {e}", exc_info=True)
+            self.log_error(rule_id, rule.get('account_phone') if 'rule' in locals() and rule else 'unknown', 'start_error', str(e))
+            # Attempt to set status to 'error' in DB
+            if self._initialized and self.db_connection:
+                 cursor = self.db_connection.cursor()
+                 cursor.execute("UPDATE forwarding_rules SET status = 'error', updated_at = ? WHERE id = ?", (datetime.now(timezone.utc), rule_id))
+                 self.db_connection.commit()
+            return False, f"Error: {str(e)}"
+
     async def setup_forwarding_handler(self, session_key):
-        """Setup message forwarding event handler with enhanced debugging"""
+        session = self.forwarding_sessions.get(session_key)
+        if not session:
+            self.logger.error(f"Session {session_key} not found for handler setup.")
+            return
+
+        client = session['client'] # Client is now stored in session data
+        source_chat_id = session['source_chat_id']
+
         try:
-            session = self.forwarding_sessions[session_key]
-            client = session['account']['client']
-            source_chat_id = session['source_chat_id']
-            rule_id = session['rule_id']
-            
-            # Test if we can access the channel first
-            try:
-                entity = await client.get_entity(source_chat_id)
-                self.logger.info(f"Successfully accessed source chat: {entity.title}")
-                
-                # Get recent messages to test access
-                messages = await client.get_messages(entity, limit=1)
-                self.logger.info(f"Can read messages from source chat: {len(messages)} messages found")
-                
-            except Exception as e:
-                self.logger.error(f"Cannot access source chat {source_chat_id}: {e}")
+            entity = await client.get_entity(source_chat_id)
+            self.logger.info(f"Handler: Successfully accessed source chat '{getattr(entity, 'title', source_chat_id)}' for session {session_key}.")
+        except ValueError as e: # Entity not found
+            self.logger.error(f"Handler: Cannot access source chat {source_chat_id} for session {session_key}: {e}. Rule may not work.")
+            self.log_error(session['rule_id'], session['account']['phone'], 'source_chat_inaccessible', str(e))
+            # Update rule status to error in DB
+            self._update_rule_status_in_db(session['rule_id'], 'error', f"Source chat {source_chat_id} inaccessible: {e}")
+            session['status'] = 'error' # Update in-memory session too
+            return
+        except Exception as e: # Other errors like permissions, not connected (should be caught earlier)
+            self.logger.error(f"Handler: Error getting entity for source chat {source_chat_id} in session {session_key}: {e}", exc_info=True)
+            self.log_error(session['rule_id'], session['account']['phone'], 'source_chat_error', str(e))
+            self._update_rule_status_in_db(session['rule_id'], 'error', f"Source chat error: {e}")
+            session['status'] = 'error'
+            return
+
+        # Define unique handler name based on session_key to allow removal if needed, though Telethon typically overwrites.
+        # However, direct removal by function object is more reliable if Telethon's internal list is accessible.
+        # For now, rely on status check within handler.
+
+        @client.on(events.NewMessage(chats=source_chat_id))
+        async def message_handler(event: events.NewMessage.Event):
+            # Check if this specific session is still active and running
+            active_session = self.forwarding_sessions.get(session_key)
+            if not active_session or active_session['status'] != 'running':
+                self.logger.debug(f"Handler for session {session_key} invoked but session not running or found. Ignoring.")
+                # Optionally, try to remove this specific handler instance if possible and if it's an old one.
+                # client.remove_event_handler(message_handler) # This might be complex to do correctly here.
                 return
-            
-            @client.on(events.NewMessage(chats=source_chat_id))
-            async def message_handler(event):
-                try:
-                    self.logger.info(f"🔥 NEW MESSAGE RECEIVED in session {session_key}")
-                    self.logger.info(f"Message ID: {event.message.id}")
-                    self.logger.info(f"Message text: {event.message.message[:100]}...")
-                    self.logger.info(f"From chat: {event.chat_id}")
-                    
-                    if session_key not in self.forwarding_sessions:
-                        self.logger.warning(f"Session {session_key} no longer exists")
-                        return
-                    
-                    if self.forwarding_sessions[session_key]['status'] != 'running':
-                        self.logger.warning(f"Session {session_key} is not running")
-                        return
-                    
-                    # Update last activity
-                    self.forwarding_sessions[session_key]['last_activity'] = datetime.now()
-                    
-                    await self.forward_message_to_destinations(session_key, event)
-                    
-                except Exception as e:
-                    self.logger.error(f"Error in message handler for session {session_key}: {e}")
-                    self.logger.error(traceback.format_exc())
-            
-            self.logger.info(f"✅ Forwarding handler setup completed for session {session_key}")
-            
-            # Test the handler by checking if we can catch existing messages
+
+            self.logger.info(f"🔥 MSG for rule {active_session['rule_id']} (session {session_key}): ID {event.message.id} from {event.chat_id}")
+            active_session['last_activity'] = datetime.now(timezone.utc)
+
+            # Update last_message_id in DB and session
+            # This should be done *after* successful processing or based on requirements
+            # For now, let's assume we process it, then update.
+            # current_last_msg_id = active_session.get('last_message_id', 0)
+            # if event.message.id > current_last_msg_id:
+            # active_session['last_message_id'] = event.message.id
+            # self._update_rule_last_message_id_in_db(active_session['rule_id'], event.message.id)
+
             try:
-                test_messages = await client.get_messages(source_chat_id, limit=1)
-                if test_messages:
-                    self.logger.info(f"✅ Can access messages from source chat. Latest message ID: {test_messages[0].id}")
-                else:
-                    self.logger.warning(f"⚠️ No messages found in source chat")
-            except Exception as e:
-                self.logger.error(f"❌ Error testing message access: {e}")
-            
-        except Exception as e:
-            self.logger.error(f"Error setting up forwarding handler for {session_key}: {e}")
-            self.logger.error(traceback.format_exc())
-            raise e
-    
+                await self.forward_message_to_destinations(session_key, event)
+            except Exception as e: # Catch errors from forwarding logic
+                self.logger.error(f"Error during forward_message_to_destinations for session {session_key}: {e}", exc_info=True)
+                # Error is logged within forward_message_to_destinations already.
+
+        # Add handler to client. Store it if removal is needed, though Telethon usually manages this.
+        # client.add_event_handler(message_handler) # Not needed if using @client.on decorator and client is in scope.
+        self.logger.info(f"✅ Event handler for NewMessage set up for session {session_key} on source {source_chat_id}.")
+
+
     async def forward_message_to_destinations(self, session_key, event):
-        """Forward message to all destination chats with enhanced error handling"""
-        session = self.forwarding_sessions[session_key]
-        client = session['account']['client']
-        keywords = session['keywords']
-        destination_chat_ids = session['destination_chat_ids']
+        session = self.forwarding_sessions.get(session_key)
+        if not session: self.logger.error(f"Session {session_key} disappeared during forwarding."); return
+
+        client = session['client']
+        message_text = event.message.message or ""
         rule_id = session['rule_id']
-        
-        try:
-            message_text = event.message.message or ""
-            
-            # Check keywords filter
-            if keywords:
-                keyword_match = any(keyword.lower() in message_text.lower() for keyword in keywords)
-                if not keyword_match:
-                    self.logger.info(f"Message filtered out - no keyword match")
-                    return  # Message doesn't contain required keywords
-            
-            successful_forwards = 0
-            failed_forwards = 0
-            
-            # Forward to each destination with individual error handling
-            for dest_chat_id in destination_chat_ids:
-                try:
-                    # Add delay to prevent rate limiting
-                    await asyncio.sleep(1)
-                    
-                    # Forward the original message
-                    forwarded_msg = await client.forward_messages(
-                        entity=dest_chat_id,
-                        messages=event.message,
-                        from_peer=event.chat_id
-                    )
-                    
-                    # Log successful forward
-                    if forwarded_msg:
-                        self.log_forwarded_message(
-                            rule_id,
-                            session['account']['phone'],
-                            event.chat_id,
-                            event.message.id,
-                            dest_chat_id,
-                            forwarded_msg[0].id,
-                            message_text[:200]  # Store first 200 chars
-                        )
-                        successful_forwards += 1
-                        
-                        self.logger.info(f"✅ Message forwarded from {event.chat_id} to {dest_chat_id}")
-                    
-                except errors.FloodWaitError as e:
-                    self.logger.warning(f"Flood wait error for destination {dest_chat_id}: {e.seconds} seconds")
-                    self.log_error(rule_id, session['account']['phone'], 'flood_wait', 
-                                 f"Destination {dest_chat_id}: {e.seconds}s")
-                    failed_forwards += 1
-                    # Wait for flood wait period
-                    await asyncio.sleep(min(e.seconds, 300))  # Max 5 minutes
-                    
-                except errors.ChatWriteForbiddenError:
-                    self.logger.warning(f"Cannot write to chat {dest_chat_id}")
-                    self.log_error(rule_id, session['account']['phone'], 'write_forbidden', 
-                                 f"Destination {dest_chat_id}")
-                    failed_forwards += 1
-                    
-                except errors.PeerIdInvalidError:
-                    self.logger.warning(f"Invalid peer ID {dest_chat_id}")
-                    self.log_error(rule_id, session['account']['phone'], 'invalid_peer', 
-                                 f"Destination {dest_chat_id}")
-                    failed_forwards += 1
-                    
-                except Exception as e:
-                    self.logger.error(f"Error forwarding to {dest_chat_id}: {e}")
-                    self.log_error(rule_id, session['account']['phone'], 'forward_error', 
-                                 f"Destination {dest_chat_id}: {str(e)}")
-                    failed_forwards += 1
-            
-            # Update session statistics
+        account_phone = session['account']['phone']
+        source_chat_id = session['source_chat_id'] # Actual chat_id from event if available event.chat_id
+
+        if session['keywords']:
+            if not any(k.lower() in message_text.lower() for k in session['keywords']):
+                self.logger.debug(f"Rule {rule_id}: Message ID {event.message.id} filtered out (no keyword match).")
+                return
+
+        successful_forwards = 0
+        for dest_chat_id in session['destination_chat_ids']:
+            try:
+                await asyncio.sleep(self.account_manager._config.get('delay_between_forwards_seconds', 1.5)) # Use a config value
+
+                # Ensure client is still connected before each forward attempt
+                if not client.is_connected():
+                    self.logger.warning(f"Client for {account_phone} disconnected before forwarding to {dest_chat_id}. Attempting reconnect.")
+                    conn_success, _ = await self.account_manager.connect_account(account_phone)
+                    if not conn_success:
+                        self.log_error(rule_id, account_phone, 'client_disconnected', f"Failed to reconnect for dest {dest_chat_id}")
+                        continue # Skip this destination, try next or wait for next message
+                    client = self.account_manager._clients.get(account_phone) # Get potentially new client instance
+                    if not client: continue # Should not happen
+
+                forwarded_msgs = await client.forward_messages(entity=dest_chat_id, messages=event.message, from_peer=source_chat_id)
+
+                if forwarded_msgs:
+                    dest_msg_id = forwarded_msgs[0].id if isinstance(forwarded_msgs, list) and forwarded_msgs else getattr(forwarded_msgs, 'id', None)
+                    self.log_forwarded_message(rule_id, account_phone, source_chat_id, event.message.id, dest_chat_id, dest_msg_id, message_text[:250])
+                    successful_forwards += 1
+                self.logger.info(f"Rule {rule_id}: Forwarded msg {event.message.id} to {dest_chat_id} via {account_phone}")
+
+            except errors.FloodWaitError as e:
+                self.logger.warning(f"Rule {rule_id}: FloodWait to {dest_chat_id} ({e.seconds}s) via {account_phone}.")
+                self.log_error(rule_id, account_phone, 'flood_wait', f"To {dest_chat_id}: {e.seconds}s")
+                await asyncio.sleep(e.seconds + 5) # Wait out flood + buffer
+            except (errors.ChatWriteForbiddenError, errors.ChannelPrivateError, errors.UserBannedInChannelError) as e:
+                self.logger.warning(f"Rule {rule_id}: Permission error to {dest_chat_id} via {account_phone}: {e}")
+                self.log_error(rule_id, account_phone, 'permission_error', f"To {dest_chat_id}: {type(e).__name__}")
+                # Consider marking this destination as problematic for this rule
+            except errors.PeerIdInvalidError:
+                self.logger.warning(f"Rule {rule_id}: Invalid Peer ID for {dest_chat_id} via {account_phone}.")
+                self.log_error(rule_id, account_phone, 'peer_invalid', f"To {dest_chat_id}")
+            except Exception as e:
+                self.logger.error(f"Rule {rule_id}: Error forwarding to {dest_chat_id} via {account_phone}: {e}", exc_info=True)
+                self.log_error(rule_id, account_phone, 'general_forward_error', f"To {dest_chat_id}: {type(e).__name__} - {e}")
+
+        if successful_forwards > 0 and self.db_connection:
             session['messages_forwarded'] += successful_forwards
-            
-            # Update database statistics
+            try:
+                cursor = self.db_connection.cursor()
+                cursor.execute("UPDATE forwarding_rules SET messages_forwarded = messages_forwarded + ?, updated_at = ? WHERE id = ?",
+                               (successful_forwards, datetime.now(timezone.utc), rule_id))
+                self.db_connection.commit()
+            except sqlite3.Error as e:
+                self.logger.error(f"DB Error updating messages_forwarded for rule {rule_id}: {e}")
+
+        # Update last_message_id for the rule to prevent re-forwarding on restart
+        # This should be the ID of the message from the source chat
+        self._update_rule_last_message_id_in_db(rule_id, event.message.id)
+        session['last_message_id'] = event.message.id
+
+
+    def _update_rule_status_in_db(self, rule_id: int, status: str, error_message: Optional[str] = None):
+        if not self._initialized or not self.db_connection: return
+        try:
             cursor = self.db_connection.cursor()
-            cursor.execute('''
-                UPDATE forwarding_rules 
-                SET messages_forwarded = messages_forwarded + ? 
-                WHERE id = ?
-            ''', (successful_forwards, rule_id))
+            now = datetime.now(timezone.utc)
+            if error_message:
+                cursor.execute("UPDATE forwarding_rules SET status = ?, last_error = ?, updated_at = ? WHERE id = ?",
+                               (status, error_message, now, rule_id))
+            else:
+                cursor.execute("UPDATE forwarding_rules SET status = ?, updated_at = ? WHERE id = ?", (status, now, rule_id))
             self.db_connection.commit()
-            
-            self.logger.info(f"Forwarding completed for rule {rule_id}: {successful_forwards} successful, {failed_forwards} failed")
-            
-        except Exception as e:
-            self.logger.error(f"Error in forward_message_to_destinations: {e}")
-            self.log_error(rule_id, session['account']['phone'], 'forward_general_error', str(e))
-    
-    def log_forwarded_message(self, rule_id, account_phone, source_chat_id, source_msg_id, 
+        except sqlite3.Error as e:
+            self.logger.error(f"DB Error updating status for rule {rule_id} to {status}: {e}")
+
+    def _update_rule_last_message_id_in_db(self, rule_id: int, message_id: int):
+        if not self._initialized or not self.db_connection: return
+        try:
+            cursor = self.db_connection.cursor()
+            cursor.execute("UPDATE forwarding_rules SET last_message_id = ?, updated_at = ? WHERE id = ?",
+                           (message_id, datetime.now(timezone.utc), rule_id))
+            self.db_connection.commit()
+        except sqlite3.Error as e:
+            self.logger.error(f"DB Error updating last_message_id for rule {rule_id}: {e}")
+
+
+    def log_forwarded_message(self, rule_id, account_phone, source_chat_id, source_msg_id,
                              dest_chat_id, dest_msg_id, message_text):
-        """Log forwarded message to database"""
+        if not self._initialized or not self.db_connection: return
         try:
             cursor = self.db_connection.cursor()
             cursor.execute('''
-                INSERT INTO forwarded_messages 
-                (rule_id, account_phone, source_chat_id, source_message_id, 
-                 destination_chat_id, destination_message_id, message_text)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            ''', (rule_id, account_phone, source_chat_id, source_msg_id, 
-                  dest_chat_id, dest_msg_id, message_text))
+                INSERT INTO forwarded_messages
+                (rule_id, account_phone, source_chat_id, source_message_id,
+                 destination_chat_id, destination_message_id, message_text, forwarded_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (rule_id, account_phone, source_chat_id, source_msg_id,
+                  dest_chat_id, dest_msg_id, message_text, datetime.now(timezone.utc)))
             self.db_connection.commit()
-        except Exception as e:
-            self.logger.error(f"Error logging forwarded message: {e}")
-    
+        except sqlite3.Error as e:
+            self.logger.error(f"DB error logging forwarded message for rule {rule_id}: {e}")
+
     def log_error(self, rule_id, account_phone, error_type, error_message):
-        """Log error to database"""
+        if not self._initialized or not self.db_connection: return
         try:
             cursor = self.db_connection.cursor()
             cursor.execute('''
-                INSERT INTO forwarding_errors 
-                (rule_id, account_phone, error_type, error_message)
-                VALUES (?, ?, ?, ?)
-            ''', (rule_id, account_phone, error_type, error_message))
+                INSERT INTO forwarding_errors
+                (rule_id, account_phone, error_type, error_message, occurred_at)
+                VALUES (?, ?, ?, ?, ?)
+            ''', (rule_id, account_phone, error_type, str(error_message)[:1000], datetime.now(timezone.utc))) # Limit error message length
             self.db_connection.commit()
-        except Exception as e:
-            self.logger.error(f"Error logging error: {e}")
-    
-    async def stop_forwarding(self, rule_id):
-        """Stop forwarding for a specific rule"""
+        except sqlite3.Error as e:
+            self.logger.error(f"DB error logging error for rule {rule_id}: {e}")
+
+    async def stop_forwarding(self, rule_id, update_db=True):
         try:
-            cursor = self.db_connection.cursor()
-            cursor.execute('SELECT account_phone FROM forwarding_rules WHERE id = ?', (rule_id,))
-            result = cursor.fetchone()
-            
-            if not result:
-                return False, "Rule not found"
-            
-            account_phone = result[0]
-            session_key = f"{account_phone}_{rule_id}"
-            
-            # Update rule status
-            cursor.execute('UPDATE forwarding_rules SET status = ? WHERE id = ?', ('stopped', rule_id))
-            self.db_connection.commit()
-            
-            # Remove session
-            if session_key in self.forwarding_sessions:
-                self.forwarding_sessions[session_key]['status'] = 'stopped'
-                del self.forwarding_sessions[session_key]
-            
-            self.logger.info(f"Stopped forwarding for rule {rule_id}")
-            return True, "Forwarding stopped successfully"
-            
+            rule_to_stop = None
+            # Find account_phone for session_key construction
+            # This might be simplified if rule details are already in self.forwarding_sessions
+            session_key_to_remove = None
+            for sk, sess_data in self.forwarding_sessions.items():
+                if sess_data['rule_id'] == rule_id:
+                    session_key_to_remove = sk
+                    rule_to_stop = sess_data
+                    break
+
+            if session_key_to_remove:
+                self.forwarding_sessions[session_key_to_remove]['status'] = 'stopped'
+                # TODO: Properly remove event handlers from client if possible/needed.
+                # This is complex as handlers are anonymous within the decorator.
+                # Relying on status check inside handler is current approach.
+                del self.forwarding_sessions[session_key_to_remove]
+                self.logger.info(f"Removed session {session_key_to_remove} from active sessions.")
+            else: # Rule might not be in active sessions (e.g. already stopped, or error)
+                 self.logger.info(f"Rule {rule_id} not found in active forwarding_sessions. Ensuring DB status is 'stopped'.")
+
+
+            if update_db and self._initialized and self.db_connection:
+                self._update_rule_status_in_db(rule_id, 'stopped')
+
+            self.logger.info(f"Forwarding stopped for rule ID: {rule_id}")
+            return True, "Forwarding stopped successfully."
+
         except Exception as e:
-            self.logger.error(f"Error stopping forwarding for rule {rule_id}: {e}")
-            return False, f"Error stopping forwarding: {str(e)}"
-    
+            self.logger.error(f"Error stopping forwarding for rule {rule_id}: {e}", exc_info=True)
+            return False, f"Error: {str(e)}"
+
+    async def restart_active_rules_from_db(self):
+        """Load rules with 'running' status from DB and attempt to start them."""
+        if not self._initialized or not self.db_connection:
+            self.logger.error("Cannot restart rules, DB not initialized.")
+            return
+        self.logger.info("Checking for 'running' rules in DB to restart...")
+        rules = await self.get_forwarding_rules() # Gets all rules
+        restarted_count = 0
+        for rule_data in rules:
+            if rule_data['status'] == 'running':
+                self.logger.info(f"Attempting to restart rule ID {rule_data['id']} (status was 'running')...")
+                success, message = await self.start_forwarding(rule_data['id']) # start_forwarding handles client checks
+                if success:
+                    restarted_count += 1
+                else:
+                    self.logger.error(f"Failed to restart rule ID {rule_data['id']}: {message}. Setting status to 'error'.")
+                    self._update_rule_status_in_db(rule_data['id'], 'error', f"Restart failed: {message}")
+        self.logger.info(f"Restarted {restarted_count} active rules.")
+
+
     async def get_forwarding_rules(self, account_phone=None):
-        """Get all forwarding rules with enhanced information"""
+        if not self._initialized or not self.db_connection: return []
         try:
             cursor = self.db_connection.cursor()
-            
             if account_phone:
-                cursor.execute('SELECT * FROM forwarding_rules WHERE account_phone = ? ORDER BY created_at DESC', (account_phone,))
+                cursor.execute("SELECT * FROM forwarding_rules WHERE account_phone = ? ORDER BY created_at DESC", (account_phone,))
             else:
-                cursor.execute('SELECT * FROM forwarding_rules ORDER BY created_at DESC')
-            
-            rules = cursor.fetchall()
-            
-            formatted_rules = []
-            for rule in rules:
-                formatted_rules.append({
-                    'id': rule[0],
-                    'account_phone': rule[1],
-                    'source_chat_id': rule[2],
-                    'source_chat_name': rule[3],
-                    'destination_chat_ids': json.loads(rule[4]),
-                    'keywords': json.loads(rule[5]) if rule[5] else None,
-                    'status': rule[6],
-                    'created_at': rule[7],
-                    'last_message_id': rule[8],
-                    'messages_forwarded': rule[9] if len(rule) > 9 else 0
-                })
-            
+                cursor.execute("SELECT * FROM forwarding_rules ORDER BY created_at DESC")
+
+            rules_rows = cursor.fetchall()
+            formatted_rules = [dict(row) for row in rules_rows] # Convert rows to dicts
+            for rule in formatted_rules: # Parse JSON fields
+                if rule.get('destination_chat_ids'): rule['destination_chat_ids'] = json.loads(rule['destination_chat_ids'])
+                if rule.get('keywords'): rule['keywords'] = json.loads(rule['keywords'])
             return formatted_rules
-            
-        except Exception as e:
-            self.logger.error(f"Error getting forwarding rules: {e}")
+        except sqlite3.Error as e:
+            self.logger.error(f"DB error getting forwarding rules: {e}", exc_info=True)
             return []
-    
-    async def get_forwarding_statistics(self, rule_id=None):
-        """Get comprehensive forwarding statistics"""
+
+    async def get_forwarding_statistics(self, rule_id=None): # Assumes DB is initialized
+        if not self._initialized or not self.db_connection: return {}
         try:
+            # ... (implementation is mostly fine, ensure DB connection is used)
+            # This method primarily queries DB, so it's okay.
             cursor = self.db_connection.cursor()
-            
+            base_query_messages = "FROM forwarded_messages"
+            base_query_errors = "FROM forwarding_errors"
+            params = ()
+
             if rule_id:
-                # Statistics for specific rule
-                cursor.execute('''
-                    SELECT COUNT(*) as total_forwarded,
-                           COUNT(DISTINCT destination_chat_id) as unique_destinations,
-                           MIN(forwarded_at) as first_forward,
-                           MAX(forwarded_at) as last_forward
-                    FROM forwarded_messages 
-                    WHERE rule_id = ?
-                ''', (rule_id,))
-            else:
-                # Global statistics
-                cursor.execute('''
-                    SELECT COUNT(*) as total_forwarded,
-                           COUNT(DISTINCT destination_chat_id) as unique_destinations,
-                           MIN(forwarded_at) as first_forward,
-                           MAX(forwarded_at) as last_forward
-                    FROM forwarded_messages
-                ''')
-            
-            stats = cursor.fetchone()
-            
-            # Get error statistics
-            if rule_id:
-                cursor.execute('SELECT COUNT(*) FROM forwarding_errors WHERE rule_id = ?', (rule_id,))
-            else:
-                cursor.execute('SELECT COUNT(*) FROM forwarding_errors')
-            
+                base_query_messages += " WHERE rule_id = ?"
+                base_query_errors += " WHERE rule_id = ?"
+                params = (rule_id,)
+
+            cursor.execute(f"SELECT COUNT(*), COUNT(DISTINCT destination_chat_id), MIN(forwarded_at), MAX(forwarded_at) {base_query_messages}", params)
+            stats_msg = cursor.fetchone()
+            cursor.execute(f"SELECT COUNT(*) {base_query_errors}", params)
             error_count = cursor.fetchone()[0]
-            
+
             return {
-                'total_forwarded': stats[0] if stats else 0,
-                'unique_destinations': stats[1] if stats else 0,
-                'first_forward': stats[2] if stats else None,
-                'last_forward': stats[3] if stats else None,
+                'total_forwarded': stats_msg[0] if stats_msg else 0,
+                'unique_destinations': stats_msg[1] if stats_msg else 0,
+                'first_forward': stats_msg[2] if stats_msg else None,
+                'last_forward': stats_msg[3] if stats_msg else None,
                 'total_errors': error_count
             }
-            
-        except Exception as e:
-            self.logger.error(f"Error getting forwarding statistics: {e}")
-            return {
-                'total_forwarded': 0,
-                'unique_destinations': 0,
-                'first_forward': None,
-                'last_forward': None,
-                'total_errors': 0
-            }
-    
-    async def test_forwarding_manually(self, rule_id):
-        """Manually test forwarding by getting the latest message"""
+        except sqlite3.Error as e:
+            self.logger.error(f"DB error getting forwarding stats for rule {rule_id}: {e}", exc_info=True)
+            return {} # Return empty on error
+
+    async def test_forwarding_manually(self, rule_id): # Assumes DB is initialized
+        if not self._initialized or not self.db_connection: return False, "DB not initialized."
+        # ... (implementation is mostly fine, ensure client is fetched correctly if not in session)
         try:
             cursor = self.db_connection.cursor()
-            cursor.execute('SELECT * FROM forwarding_rules WHERE id = ?', (rule_id,))
-            rule = cursor.fetchone()
-            
-            if not rule:
-                return False, "Rule not found"
-            
-            account_phone = rule[1]
-            source_chat_id = rule[2]
-            destination_chat_ids = json.loads(rule[4])
-            
+            cursor.execute("SELECT * FROM forwarding_rules WHERE id = ?", (rule_id,))
+            rule_row = cursor.fetchone()
+            if not rule_row: return False, "Rule not found"
+            rule = dict(rule_row)
+
+            account_phone = rule['account_phone']
+            source_chat_id = rule['source_chat_id']
+            destination_chat_ids = json.loads(rule['destination_chat_ids'])
+
             account = self.account_manager.get_account_by_phone(account_phone)
-            if not account or not account['client']:
-                return False, "Account not available"
-            
-            client = account['client']
-            
-            # Get the latest message from source
+            client = self.account_manager._clients.get(account_phone) # Get active client
+
+            if not account or not client:
+                 return False, f"Account {account_phone} or its client not active/available."
+            if not client.is_connected():
+                 conn_ok, conn_msg = await self.account_manager.connect_account(account_phone)
+                 if not conn_ok: return False, f"Could not connect {account_phone}: {conn_msg}"
+                 client = self.account_manager._clients.get(account_phone) # Re-fetch client
+
             messages = await client.get_messages(source_chat_id, limit=1)
-            if not messages:
-                return False, "No messages found in source chat"
-            
-            latest_message = messages[0]
-            self.logger.info(f"Latest message: {latest_message.message[:100]}...")
-            
-            # Forward to first destination as test
+            if not messages: return False, "No messages in source chat."
+
             if destination_chat_ids:
-                try:
-                    forwarded = await client.forward_messages(
-                        entity=destination_chat_ids[0],
-                        messages=latest_message,
-                        from_peer=source_chat_id
-                    )
-                    return True, f"Test forward successful: {forwarded[0].id}"
-                except Exception as e:
-                    return False, f"Test forward failed: {str(e)}"
-            
-            return False, "No destinations configured"
-            
+                await client.forward_messages(entity=destination_chat_ids[0], messages=messages[0], from_peer=source_chat_id)
+                return True, f"Test forward of message {messages[0].id} successful."
+            return False, "No destinations."
         except Exception as e:
-            self.logger.error(f"Error in manual test: {e}")
+            self.logger.error(f"Error in manual test for rule {rule_id}: {e}", exc_info=True)
             return False, str(e)
+
+[end of forwarding_manager.py]
