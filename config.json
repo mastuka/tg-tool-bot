@@ -1,0 +1,15 @@
+{
+    "api_id": "27365542",
+    "api_hash": "8c84077f5ed0a64b65b8270fad131817",
+    "bot_token": "7709950250:AAGXCkwedMGYdIT0Rs67pHJ729B4pHSsXpg",
+    "authorized_users": [7939220128],
+    "delay_min": 15,
+    "delay_max": 45,
+    "daily_limit": 45,
+    "check_interval": 3600,
+    "max_flood_wait": 300,
+    "retry_attempts": 3,
+    "database_path": "forwarding.db",
+    "sessions_path": "sessions/",
+    "logs_path": "logs/"
+}
